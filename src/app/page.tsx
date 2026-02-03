@@ -10,6 +10,14 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+type JsonSchema = {
+  $schema?: string;
+  type?: string | string[];
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  required?: string[];
+};
+
 const DEFAULT_INPUT = `{
   "meta": { "source": "example", "count": 3 },
   "users": [
@@ -38,6 +46,93 @@ const trimStructure = (value: JsonValue, maxArrayLen: number): JsonValue => {
   return value;
 };
 
+const normalizeTypes = (schema: JsonSchema | null): string[] => {
+  if (!schema?.type) return [];
+  return Array.isArray(schema.type) ? schema.type : [schema.type];
+};
+
+const mergeSchemas = (left: JsonSchema | null, right: JsonSchema | null): JsonSchema => {
+  if (!left) return right ?? {};
+  if (!right) return left;
+
+  const types = Array.from(
+    new Set([...normalizeTypes(left), ...normalizeTypes(right)])
+  );
+  const merged: JsonSchema = {};
+  if (types.length > 0) {
+    merged.type = types.length === 1 ? types[0] : types;
+  }
+
+  const leftIsObject = normalizeTypes(left).includes("object");
+  const rightIsObject = normalizeTypes(right).includes("object");
+  if (leftIsObject && rightIsObject) {
+    const properties: Record<string, JsonSchema> = {};
+    const leftProps = left.properties ?? {};
+    const rightProps = right.properties ?? {};
+    const keys = new Set([...Object.keys(leftProps), ...Object.keys(rightProps)]);
+    keys.forEach((key) => {
+      properties[key] = mergeSchemas(leftProps[key] ?? null, rightProps[key] ?? null);
+    });
+    merged.properties = properties;
+
+    const leftRequired = new Set(left.required ?? []);
+    const rightRequired = new Set(right.required ?? []);
+    const required = [...leftRequired].filter((key) => rightRequired.has(key));
+    if (required.length > 0) {
+      merged.required = required;
+    }
+  }
+
+  const leftIsArray = normalizeTypes(left).includes("array");
+  const rightIsArray = normalizeTypes(right).includes("array");
+  if (leftIsArray && rightIsArray) {
+    merged.items = mergeSchemas(left.items ?? null, right.items ?? null);
+  }
+
+  return merged;
+};
+
+const inferSchema = (value: JsonValue): JsonSchema => {
+  if (value === null) return { type: "null" };
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return { type: "array", items: {} };
+    }
+    const itemsSchema = value.reduce<JsonSchema | null>(
+      (acc, item) => mergeSchemas(acc, inferSchema(item)),
+      null
+    );
+    return { type: "array", items: itemsSchema ?? {} };
+  }
+
+  if (typeof value === "object") {
+    const properties: Record<string, JsonSchema> = {};
+    Object.entries(value).forEach(([key, val]) => {
+      properties[key] = inferSchema(val);
+    });
+    const required = Object.keys(properties);
+    return {
+      type: "object",
+      properties,
+      required: required.length > 0 ? required : undefined,
+    };
+  }
+
+  if (typeof value === "number") {
+    return { type: Number.isInteger(value) ? "integer" : "number" };
+  }
+
+  return { type: typeof value };
+};
+
+const generateSchema = (value: JsonValue): JsonSchema => {
+  const schema = inferSchema(value);
+  return {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    ...schema,
+  };
+};
+
 export default function Home() {
   const [input, setInput] = useState(DEFAULT_INPUT);
   const [output, setOutput] = useState("");
@@ -46,6 +141,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [copyLabel, setCopyLabel] = useState("Copy");
   const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
+  const [outputMode, setOutputMode] = useState<"trim" | "schema">("trim");
 
   const parsedLimit = useMemo(() => {
     const parsed = Number.parseInt(arrayLimit, 10);
@@ -67,6 +163,25 @@ export default function Home() {
       setOutput(JSON.stringify(trimmed, null, 2));
       setOutputValue(trimmed);
       setCollapsedPaths(new Set());
+      setOutputMode("trim");
+      setError(null);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Unable to parse JSON.";
+      setError(`JSON error: ${message}`);
+      setOutput("");
+      setOutputValue(null);
+    }
+  };
+
+  const handleGenerateSchema = () => {
+    try {
+      const parsed = JSON.parse(input) as JsonValue;
+      const schema = generateSchema(parsed);
+      setOutput(JSON.stringify(schema, null, 2));
+      setOutputValue(schema as JsonValue);
+      setCollapsedPaths(new Set());
+      setOutputMode("schema");
       setError(null);
     } catch (err) {
       const message =
@@ -234,9 +349,8 @@ export default function Home() {
           </div>
         </div>
         <p className="max-w-3xl text-sm text-zinc-600">
-          Paste JSON on the left. After trimming, every array is limited to the
-          chosen number of items, and the right side shows shortened data with
-          the original structure preserved.
+          Paste JSON on the left. You can trim arrays to a fixed length or
+          generate a JSON Schema with required fields inferred from the input.
         </p>
       </header>
 
@@ -274,7 +388,7 @@ export default function Home() {
         <section className="flex h-[560px] flex-col gap-3 rounded-2xl border border-[color:var(--panel-border)] bg-white/80 p-4 shadow-xl shadow-emerald-900/5">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold uppercase tracking-[0.2em] text-zinc-500">
-              Shortened data
+              {outputMode === "schema" ? "JSON schema" : "Shortened data"}
             </h2>
             <div className="flex items-center gap-3 text-xs text-zinc-500">
               <span>
@@ -294,7 +408,9 @@ export default function Home() {
               <div className="space-y-1 break-words">{renderJson(outputValue)}</div>
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-emerald-100/70">
-                Shortened JSON will appear here...
+                {outputMode === "schema"
+                  ? "Generated JSON Schema will appear here..."
+                  : "Shortened JSON will appear here..."}
               </div>
             )}
           </div>
@@ -319,12 +435,20 @@ export default function Home() {
             onChange={(event) => setArrayLimit(event.target.value)}
           />
         </div>
-        <button
-          className="h-12 rounded-full bg-[color:var(--accent)] px-8 text-base font-semibold text-white shadow-lg shadow-teal-900/10 transition hover:bg-[color:var(--accent-dark)]"
-          onClick={handleTrim}
-        >
-          Trim data
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            className="h-12 rounded-full bg-[color:var(--accent)] px-6 text-base font-semibold text-white shadow-lg shadow-teal-900/10 transition hover:bg-[color:var(--accent-dark)]"
+            onClick={handleTrim}
+          >
+            Trim data
+          </button>
+          <button
+            className="h-12 rounded-full border border-[color:var(--accent)] px-6 text-base font-semibold text-[color:var(--accent)] shadow-lg shadow-teal-900/10 transition hover:border-[color:var(--accent-dark)] hover:text-[color:var(--accent-dark)]"
+            onClick={handleGenerateSchema}
+          >
+            Generate schema
+          </button>
+        </div>
       </div>
     </div>
   );
